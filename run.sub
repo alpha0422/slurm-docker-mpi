@@ -19,8 +19,11 @@ CONT=${CONT:-"mlperf-nvidia:$BENCHMARK"}
 DATADIR=${DATADIR:-"/raid/data/wmt16_de_en"}
 LOGDIR=${LOGDIR:-"/raid/results/$BENCHMARK"}
 NEXP=${NEXP:-10} # Default number of times to run the benchmark
-SYSLOGGING=1
+SYSLOGGING=0
 SYS_LOG_GET="'import mlperf_compliance; from mlperf_log_utils import mlperf_submission_log; mlperf_submission_log(mlperf_compliance.constants.$BENCHMARK_NAME)'"
+
+CMD=${CMD:-"all_reduce_perf -b8M -e128M -f2 -n100 -w10 -c0"}
+MPICMD=${MPICMD:-"mpirun --tag-output --allow-run-as-root -x NCCL_SOCKET_IFNAME=^docker0,bond0,lo ${CMD} -g8"}
 
 ## DO NOT CHANGE ANYTHING BELOW -- DL params are in run_and_time.sh and config_<system>.sh files 
 
@@ -54,14 +57,16 @@ mkdir -p $(dirname "${LOGFILE_BASE}")
 
 ## Docker params
 CONTVOLS="-v $DATADIR:/data -v $LOGDIR:/results"
-DOCKEREXEC="nvidia-docker run --init --rm --net=host --uts=host --ipc=host --ulimit stack=67108864 --ulimit memlock=-1 --name=cont_${SLURM_JOB_ID} --security-opt seccomp=unconfined $IBDEVICES"
+DOCKEREXEC="nvidia-docker run --init --rm --net=host --uts=host --ipc=host --ulimit stack=67108864 --ulimit memlock=-1 --name=cont_${SLURM_JOB_ID} --security-opt seccomp=unconfined $IBDEVICES -e OMPI_MCA_mca_base_param_files=/dev/shm/mpi/${SLURM_JOB_ID}/mca_params.conf -e OMPI_ALLOW_RUN_AS_ROOT=1"
 
 ## Get version of the OS
 export MLPERF_HOST_OS="$(cat /etc/issue | head -1 | cut -f1-3 -d" ") / $(cat /etc/dgx-release | grep -E "DGX_PRETTY_NAME|DGX_OTA_VERSION" |cut -f2 -d= |cut -f2 -d '"' |paste -sd' ')"
 
 ## Prep run and launch
+MASTER_HOST=${hosts[0]}
 MASTER_IP=`getent hosts \`hostname\` | cut -d ' ' -f1`
 PORT=$((4242 + RANDOM%1000))
+MASTER_PORT=${PORT}
 SSH=''
 SRUN=''
 if [[ $INSLURM -eq 1 ]]; then
@@ -95,22 +100,13 @@ done
 wait "${pids[@]}"
 success=$? ; if [ $success -ne 0 ]; then echo "ERR: Base container launch failed."; exit $success ; fi
 
-# Launch containers
-pids=(); rets=()
-for hostn in ${hosts[@]}; do
-  $(eval echo $SSH) $DOCKEREXEC $CONTVOLS $CONT sleep infinity &
-  pids+=($!); rets+=($?);
-done
-success=0; for s in ${rets[@]}; do ((success+=s)); done ; if [ $success -ne 0 ]; then echo "ERR: Container launch failed."; exit $success ; fi
-sleep 30 # Making sure containers have time to launch 
+SYSVARS="-e CONT -e MASTER_HOST -e MASTER_IP -e MASTER_PORT -e SLURM_JOB_NUM_NODES -e SLURM_NNODES -e SLURM_NTASKS_PER_NODE"
+#SLURMVARS=$(printenv | grep SLURM | awk -F'(' '{print " -e " $1}')
 
-# Disable compat check from further running
-pids=(); rets=()
-for hostn in ${hosts[@]}; do
-  $(eval echo $SSH) docker exec cont_${SLURM_JOB_ID} rm -f /etc/shinit &
-  pids+=($!);
-done
-wait "${pids[@]}"
+# Launch containers
+srun -n $SLURM_JOB_NUM_NODES --ntasks-per-node=1 $DOCKEREXEC $CONTVOLS ${SYSVARS} -d $CONT bash -c 'sleep infinity'
+
+[[ $? -ne 0 ]] && echo "ERR: Launch sleep containers failed." && exit $?
 
 # Run benchmarks
 export NEXP
@@ -150,44 +146,64 @@ for nrun in `seq 1 $NEXP`; do
   wait "${pids[@]}"
   success=0; for s in ${rets[@]}; do ((success+=s)); done ; if [ $success -ne 0 ]; then echo "ERR: Cache clearing failed."; exit $success ; fi
 
-  ## Launching benchmark
-  pids=();
-  export MULTI_NODE=''
-  for h in `seq 0 $((SLURM_NNODES-1))`; do
-      hostn="${hosts[$h]}"
-    echo "Launching on node $hostn"
-    if [[ $SLURM_NNODES -gt 1 ]]; then
-      export MULTI_NODE=" --nnodes=$SLURM_NNODES --node_rank=$h --master_addr=$MASTER_IP --master_port=$PORT"
-    else
-      export MULTI_NODE=" --master_port=$PORT"
-    fi
-      export DOCKERENV=(
-         "-e" "DGXSYSTEM=$DGXSYSTEM"
-         "-e" "MULTI_NODE=$MULTI_NODE"
-         "-e" "LR=$LR"
-         "-e" "TRAIN_BATCH_SIZE=$TRAIN_BATCH_SIZE"
-         "-e" "TEST_BATCH_SIZE=$TEST_BATCH_SIZE"
-         "-e" "WARMUP_STEPS=$WARMUP_STEPS"
-         "-e" "REMAIN_STEPS=$REMAIN_STEPS"
-         "-e" "DECAY_INTERVAL=$DECAY_INTERVAL"
-         "-e" "TARGET=$TARGET"
-         "-e" "NUMEPOCHS=$NUMEPOCHS"
-         "-e" "MAX_SEQ_LEN=$MAX_SEQ_LEN"
-         "-e" "EXTRA_OPTS=$EXTRA_OPTS"
-         "-e" "SLURM_JOB_ID=$SLURM_JOB_ID"
-         "-e" "SLURM_NTASKS_PER_NODE=$SLURM_NTASKS_PER_NODE"
-         "-e" "SLURM_NNODES=$SLURM_NNODES"
-      )
-      # Execute command
-      set -x
-      $(eval echo $SRUN) docker exec "${DOCKERENV[@]}" cont_${SLURM_JOB_ID} ./run_and_time.sh &
-    pids+=($!);
-      set +x
+  ############################################################
+  # MPI support files - in /dev/shm/mpi/<jobid>
+  # 1. Copy user keys to /dev/shm/mpi/<jobid>
+  # 2. Create mca_params.conf
+  # 3. Create sshentry.sh to support lauching into containers on worker nodes
+  # 4. Create mpi_hosts file
+  # 5. Copy standard ssh
+
+  # Make keys and copy
+  echo ""
+  [[ $DEBUG == 1 ]] && echo "Setting up ssh keys and config"
+  mkdir -p ${HOME}/.ssh/sbatch/${SLURM_JOB_ID}
+  ssh-keygen -t rsa -b 2048 -n "" -f "${HOME}/.ssh/sbatch/${SLURM_JOB_ID}/sshkey.rsa" \
+      -C "nccl_${SLURM_JOB_ID}_"  &>/dev/null
+  echo command=\"/dev/shm/mpi/${SLURM_JOB_ID}/sshentry.sh\",no-port-forwarding,no-agent-forwarding,no-X11-forwarding $(cat ${HOME}/.ssh/sbatch/${SLURM_JOB_ID}/sshkey.rsa.pub) >> ${HOME}/.ssh/authorized_keys
+  chmod 600 ~/.ssh/authorized_keys
+
+  [[ $DEBUG == 1 ]] && echo "Copy keys: srun -n $SLURM_JOB_NUM_NODES mkdir /dev/shm/mpi && cp -R ${HOME}/.ssh/sbatch/${SLURM_JOB_ID} /dev/shm/mpi && chmod 700 /dev/shm/mpi/${SLURM_JOB_ID}"
+  srun  -n $SLURM_JOB_NUM_NODES --ntasks-per-node=1 bash -c "mkdir -p /dev/shm/mpi/${SLURM_JOB_ID}; cp -R ${HOME}/.ssh/sbatch/${SLURM_JOB_ID} /dev/shm/mpi; chmod 700 /dev/shm/mpi/${SLURM_JOB_ID}"
+
+  # Create mpi config file
+  srun  -n $SLURM_JOB_NUM_NODES --ntasks-per-node=1 tee /dev/shm/mpi/${SLURM_JOB_ID}/mca_params.conf <<EOF
+plm_rsh_agent = ssh
+plm_rsh_args = -i /dev/shm/mpi/${SLURM_JOB_ID}/sshkey.rsa -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oLogLevel=ERROR -l ${USER}
+orte_default_hostfile = /dev/shm/mpi/${SLURM_JOB_ID}/mpi_hosts
+btl_openib_warn_default_gid_prefix = 0
+mpi_warn_on_fork = 0
+allow_run_as_root = 1
+EOF
+  [[ $DEBUG == 1 ]] && echo "::mca_params.conf=" && cat /dev/shm/mpi/${SLURM_JOB_ID}/mca_params.conf
+
+  # Create ssh helper script that transfers an ssh into a compute node into the running container on that node
+  srun -n $SLURM_JOB_NUM_NODES --ntasks-per-node=1 tee /dev/shm/mpi/${SLURM_JOB_ID}/sshentry.sh <<EOF
+#!/bin/bash
+echo "::sshentry: entered \$(hostname)"
+[[ -f cont_${SLURM_JOB_ID} ]] && "::worker container not found error" && exit 1
+echo "::sshentry: running \$SSH_ORIGINAL_COMMAND"
+exec docker exec cont_${SLURM_JOB_ID} /bin/bash -c "\$SSH_ORIGINAL_COMMAND"
+EOF
+  [[ $DEBUG == 1 ]] && echo "::sshentry=" && cat /dev/shm/mpi/${SLURM_JOB_ID}/sshentry.sh
+
+  # Create mpi hostlist
+  for h in ${hosts[@]}; do
+     echo "$h slots=${SLURM_NTASKS_PER_NODE}" >> /dev/shm/mpi/${SLURM_JOB_ID}/mpi_hosts
   done
-  wait "${pids[@]}"
+  [[ $DEBUG == 1 ]] && echo 'mpi-host file=' && cat /dev/shm/mpi/${SLURM_JOB_ID}/mpi_hosts
+  srun -n $SLURM_JOB_NUM_NODES --ntasks-per-node=1 bash -c "chmod 755 /dev/shm/mpi/${SLURM_JOB_ID}/mca_params.conf;  chmod 755 /dev/shm/mpi/${SLURM_JOB_ID}/sshentry.sh"
+
+  # Check that ssh/mpi dir has correct number of files
+  [[ $(ls /dev/shm/mpi/${SLURM_JOB_ID} | wc -w) -lt 5 ]]  && echo "ERR: /dev/shm/mpi/${SLURM_JOB_ID} doesn't exist or missing ssh/mpi files" && exit $?
+
+  echo "" 
+  echo "Launching user script on master node:"
+  ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no ${hosts[0]} docker exec cont_${SLURM_JOB_ID} ${MPICMD}
+      
+  [[ $? -ne 0 ]] && echo "ERR: User script failed." && exit $?
 
   ) |& tee ${LOGFILE_BASE}_$nrun.log
-
 done
 
 # Clean up (note: on SLURM we skip this, as the epilogue will take care of it)
